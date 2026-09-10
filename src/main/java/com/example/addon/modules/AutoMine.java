@@ -5,205 +5,268 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
+import meteordevelopment.meteorclient.utils.player.FindItemResult;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
-import net.minecraft.enchantment.Enchantment;
-import net.minecraft.enchantment.EnchantmentHelper;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.item.*;
-import net.minecraft.registry.Registries;
+import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.util.Hand;
 
-import java.util.Set;
+import java.util.List;
 
-/**
- * AutoMine+ (Bản Rút Gọn) — Tự động đào và dùng /sellgui để bán item mục tiêu khi balo đầy.
- */
 public class AutoMine extends Module {
-
-    // =========================================================
-    //  Settings
-    // =========================================================
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgTrash = settings.createGroup("Trash & Sell Settings");
+    private final SettingGroup sgRepair = settings.createGroup("Auto Repair Settings");
 
+    // General Settings
     private final Setting<Item> mineBlock = sgGeneral.add(new ItemSetting.Builder()
         .name("mine-block")
-        .description("Khối quặng cho Baritone #mine (luôn là ore block).")
+        .description("Khối quặng cho Baritone #mine (ví dụ: DIAMOND_ORE, IRON_ORE...).")
         .defaultValue(Items.DIAMOND_ORE)
-        .build());
+        .build()
+    );
 
     private final Setting<Boolean> autoDetectDrop = sgGeneral.add(new BoolSetting.Builder()
         .name("auto-detect-drop")
-        .description("Bật để tự nhận diện: có Silk Touch -> bán quặng nguyên khối; không có -> bán khoáng sản.")
+        .description("Tự động nhận biết Silk Touch trong hotbar.")
         .defaultValue(true)
-        .build());
+        .build()
+    );
 
     private final Setting<Item> collectItem = sgGeneral.add(new ItemSetting.Builder()
         .name("collect-item")
-        .description("Item muốn bán khi TẮT chế độ auto-detect.")
+        .description("Item cần đếm/bán khi tắt auto-detect.")
         .defaultValue(Items.DIAMOND)
         .visible(() -> !autoDetectDrop.get())
-        .build());
+        .build()
+    );
 
     private final Setting<Integer> actionDelay = sgGeneral.add(new IntSetting.Builder()
         .name("action-delay")
-        .description("Độ trễ (ticks) giữa các thao tác click slot bán đồ.")
-        .defaultValue(5).min(1).sliderMax(20)
-        .build());
+        .description("Độ trễ (ticks) giữa các thao tác.")
+        .defaultValue(5)
+        .min(0)
+        .sliderMax(20)
+        .build()
+    );
 
-    // =========================================================
-    //  State Machine
-    // =========================================================
-    private enum State {
+    // Trash & Sell Settings
+    private final Setting<Boolean> sellTargetItem = sgTrash.add(new BoolSetting.Builder()
+        .name("sell-target-item")
+        .description("Bán cả vật phẩm mục tiêu (kim cương/quặng) khi đầy balo.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<List<Item>> trashItems = sgTrash.add(new ItemListSetting.Builder()
+        .name("trash-items")
+        .description("Các item rác sẽ được bán vào GUI /sellgui.")
+        .defaultValue(
+            Items.COBBLESTONE, Items.DIRT, Items.SAND, Items.GRAVEL, Items.STONE,
+            Items.NETHERRACK, Items.DIORITE, Items.ANDESITE, Items.GRANITE,
+            Items.COBBLED_DEEPSLATE, Items.DEEPSLATE, Items.ROTTEN_FLESH, Items.BONE,
+            Items.ARROW, Items.GUNPOWDER, Items.STRING, Items.SPIDER_EYE, Items.BLAZE_ROD, Items.ENDER_PEARL
+        )
+        .build()
+    );
+
+    // Repair Settings
+    private final Setting<Integer> minDurability = sgRepair.add(new IntSetting.Builder()
+        .name("min-durability")
+        .description("Độ bền tối thiểu của dụng cụ trước khi dừng đào để dùng bình EXP.")
+        .defaultValue(40)
+        .min(5)
+        .sliderMax(200)
+        .build()
+    );
+
+    public enum State {
         IDLE,
         START_MINE,
         MINING,
-        STOP_MINE,
-        WAIT_STOP,
-        OPEN_SELLGUI,
-        SELLGUI_GUI
+        AUTO_REPAIR,
+        OPEN_SELL_GUI,
+        SELL_GUI
     }
 
     private State currentState = State.IDLE;
     private int timer = 0;
 
     public AutoMine() {
-        super(AddonTemplate.CATEGORY, "AutoMine+", "Tự động đào và bán vào /sellgui khi đầy balo.");
+        super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự sửa đồ bằng bình EXP và bán item khi đầy balo.");
     }
 
     @Override
     public void onActivate() {
-        currentState = State.IDLE;
+        currentState = State.START_MINE;
         timer = 0;
     }
 
     @Override
     public void onDeactivate() {
-        if (mc.options != null && mc.options.attackKey != null) mc.options.attackKey.setPressed(false);
+        if (mc.player != null) {
+            ChatUtils.sendPlayerMsg("#stop");
+        }
+        currentState = State.IDLE;
     }
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.world == null) return;
-        if (timer > 0) { timer--; return; }
+
+        if (timer > 0) {
+            timer--;
+            return;
+        }
 
         switch (currentState) {
-            case IDLE:
-                currentState = State.START_MINE;
-                break;
-
             case START_MINE:
-                if (mc.currentScreen != null) mc.player.closeHandledScreen();
-                ChatUtils.sendPlayerMsg("#mine " + Registries.ITEM.getId(mineBlock.get()).toString());
-                timer = 60;
+                ChatUtils.sendPlayerMsg("#mine " + mineBlock.get().toString().replace("minecraft:", ""));
                 currentState = State.MINING;
                 break;
 
             case MINING:
-                // Nếu không còn slot trống nào trong balo -> Dừng lại để bán
-                if (isInventoryFull()) {
-                    currentState = State.STOP_MINE;
+                // 1. Kiểm tra độ bền dụng cụ
+                if (needsRepair()) {
+                    ChatUtils.sendPlayerMsg("#stop");
+                    currentState = State.AUTO_REPAIR;
+                    timer = actionDelay.get();
+                    break;
+                }
+
+                // 2. Kiểm tra khi full balo -> Đi bán
+                if (isMainInventoryFull()) {
+                    ChatUtils.sendPlayerMsg("#stop");
+                    currentState = State.OPEN_SELL_GUI;
+                    timer = actionDelay.get();
+                    break;
                 }
                 break;
 
-            case STOP_MINE:
-                ChatUtils.sendPlayerMsg("#stop");
-                timer = 40;
-                currentState = State.WAIT_STOP;
-                break;
-
-            case WAIT_STOP:
-                currentState = State.OPEN_SELLGUI;
-                break;
-
-            case OPEN_SELLGUI:
-                if (mc.currentScreen != null) mc.player.closeHandledScreen();
-                ChatUtils.sendPlayerMsg("/sellgui");
-                timer = 40; // Chờ GUI /sellgui mở lên
-                currentState = State.SELLGUI_GUI;
-                break;
-
-            case SELLGUI_GUI:
-                if (!(mc.currentScreen instanceof net.minecraft.client.gui.screen.ingame.HandledScreen)) {
+            case AUTO_REPAIR:
+                if (isFullyRepaired()) {
                     currentState = State.START_MINE;
                     break;
                 }
-                
-                // Thực hiện shift-click item mục tiêu vào /sellgui
-                if (!doSellTargetItems((net.minecraft.client.gui.screen.ingame.HandledScreen<?>) mc.currentScreen)) {
-                    // Khi đã bán hết item, đóng GUI và tiếp tục đào
-                    mc.player.closeHandledScreen();
-                    timer = 15;
+
+                FindItemResult expBottles = InvUtils.findInHotbar(Items.EXPERIENCE_BOTTLE);
+                if (expBottles.found()) {
+                    InvUtils.swap(expBottles.slot(), true);
+                    mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
+                    timer = 2; // Ném bình EXP nhanh
+                } else {
+                    // Nếu không còn bình EXP trong hotbar, tiếp tục quay lại đào hoặc dừng
                     currentState = State.START_MINE;
                 }
+                break;
+
+            case OPEN_SELL_GUI:
+                ChatUtils.sendPlayerMsg("/sellgui");
+                currentState = State.SELL_GUI;
+                timer = actionDelay.get();
+                break;
+
+            case SELL_GUI:
+                if (mc.currentScreen instanceof HandledScreen) {
+                    HandledScreen<?> screen = (HandledScreen<?>) mc.currentScreen;
+                    boolean sold = doSellItemsFromPlayerInv(screen);
+                    if (!sold) {
+                        mc.player.closeHandledScreen();
+                        currentState = State.START_MINE;
+                        timer = actionDelay.get();
+                    } else {
+                        timer = actionDelay.get();
+                    }
+                }
+                break;
+
+            default:
                 break;
         }
     }
 
-    // =========================================================
-    //  Helpers
-    // =========================================================
-
-    /** Thực hiện shift-click toàn bộ vật phẩm đang yêu cầu đào vào màn hình GUI */
-    private boolean doSellTargetItems(net.minecraft.client.gui.screen.ingame.HandledScreen<?> screen) {
-        net.minecraft.screen.ScreenHandler h = screen.getScreenHandler();
-        int cSz = h.slots.size() - 36; // Lấy vị trí bắt đầu túi đồ của người chơi
+    private boolean doSellItemsFromPlayerInv(HandledScreen<?> screen) {
+        ScreenHandler handler = screen.getScreenHandler();
+        int playerInvStart = handler.slots.size() - 36;
         Item target = getEffectiveCollectItem();
 
-        for (int i = cSz; i < h.slots.size(); i++) {
-            ItemStack st = h.getSlot(i).getStack();
-            if (!st.isEmpty() && st.getItem() == target) {
-                mc.interactionManager.clickSlot(h.syncId, i, 0, SlotActionType.QUICK_MOVE, mc.player);
-                timer = actionDelay.get();
+        for (int i = playerInvStart; i < handler.slots.size(); i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (stack.isEmpty()) continue;
+
+            Item item = stack.getItem();
+            boolean isTrash = trashItems.get().contains(item);
+            boolean isTarget = sellTargetItem.get() && (item == target || item == mineBlock.get());
+
+            if (isTrash || isTarget) {
+                clickSlot(handler.syncId, i, 0, SlotActionType.QUICK_MOVE);
                 return true;
             }
         }
         return false;
     }
 
-    /** Kiểm tra xem balo (cả hotbar và túi chính) đã full hay chưa */
-    private boolean isInventoryFull() {
-        for (int i = 0; i < 36; i++) {
-            if (mc.player.getInventory().getStack(i).isEmpty()) {
-                return false;
+    private void clickSlot(int syncId, int slotId, int button, SlotActionType actionType) {
+        mc.interactionManager.clickSlot(syncId, slotId, button, actionType, mc.player);
+    }
+
+    private boolean isMainInventoryFull() {
+        return mc.player.getInventory().main.stream().noneMatch(ItemStack::isEmpty);
+    }
+
+    private boolean needsRepair() {
+        ItemStack mainHand = mc.player.getMainHandStack();
+        if (mainHand.isEmpty() || !mainHand.isDamageable()) return false;
+        int currentDurability = mainHand.getMaxDamage() - mainHand.getDamage();
+        return currentDurability <= minDurability.get();
+    }
+
+    private boolean isFullyRepaired() {
+        ItemStack mainHand = mc.player.getMainHandStack();
+        if (mainHand.isEmpty() || !mainHand.isDamageable()) return true;
+        return mainHand.getDamage() == 0;
+    }
+
+    private Item getEffectiveCollectItem() {
+        if (autoDetectDrop.get()) {
+            if (hasSilkTouchInHotbar()) {
+                return mineBlock.get();
+            } else {
+                return getOreDrop(mineBlock.get());
             }
         }
-        return true;
+        return collectItem.get();
     }
 
-    /** Xác định item cần bán (hỗ trợ tự động nhận diện Silk Touch hoặc do cài đặt chỉ định) */
-    private Item getEffectiveCollectItem() {
-        if (!autoDetectDrop.get()) return collectItem.get();
-        return hasSilkTouchInHotbar() ? mineBlock.get() : getOreDrop(mineBlock.get());
-    }
-
-    /** Kiểm tra Hotbar xem người chơi có đang cầm công cụ có Silk Touch không */
     private boolean hasSilkTouchInHotbar() {
-        if (mc.player == null || mc.world == null) return false;
         for (int i = 0; i < 9; i++) {
-            ItemStack s = mc.player.getInventory().getStack(i);
-            if (s.isEmpty()) continue;
-            
-            Set<RegistryEntry<Enchantment>> enchants = EnchantmentHelper.getEnchantments(s).getEnchantments();
-            for (RegistryEntry<Enchantment> entry : enchants) {
-                if (entry.getIdAsString().toLowerCase().contains("silk_touch")) return true;
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (!stack.isEmpty() && stack.hasEnchantments()) {
+                if (stack.getEnchantments().getEnchantments().stream()
+                    .anyMatch(entry -> entry.getIdAsString().toLowerCase().contains("silk_touch"))) {
+                    return true;
+                }
             }
         }
         return false;
     }
 
-    /** Trả về item rớt ra khi đập quặng nếu không có Silk Touch */
-    private static Item getOreDrop(Item oreBlock) {
-        if (oreBlock == Items.DIAMOND_ORE      || oreBlock == Items.DEEPSLATE_DIAMOND_ORE)  return Items.DIAMOND;
-        if (oreBlock == Items.IRON_ORE         || oreBlock == Items.DEEPSLATE_IRON_ORE)     return Items.RAW_IRON;
-        if (oreBlock == Items.GOLD_ORE         || oreBlock == Items.DEEPSLATE_GOLD_ORE
-                                               || oreBlock == Items.NETHER_GOLD_ORE)        return Items.RAW_GOLD;
-        if (oreBlock == Items.COPPER_ORE       || oreBlock == Items.DEEPSLATE_COPPER_ORE)   return Items.RAW_COPPER;
-        if (oreBlock == Items.COAL_ORE         || oreBlock == Items.DEEPSLATE_COAL_ORE)     return Items.COAL;
-        if (oreBlock == Items.EMERALD_ORE      || oreBlock == Items.DEEPSLATE_EMERALD_ORE)  return Items.EMERALD;
-        if (oreBlock == Items.LAPIS_ORE        || oreBlock == Items.DEEPSLATE_LAPIS_ORE)    return Items.LAPIS_LAZULI;
-        if (oreBlock == Items.REDSTONE_ORE     || oreBlock == Items.DEEPSLATE_REDSTONE_ORE) return Items.REDSTONE;
-        if (oreBlock == Items.NETHER_QUARTZ_ORE)                                            return Items.QUARTZ;
-        if (oreBlock == Items.ANCIENT_DEBRIS)                                               return Items.NETHERITE_SCRAP;
-        return oreBlock;
+    private Item getOreDrop(Item ore) {
+        if (ore == Items.DIAMOND_ORE || ore == Items.DEEPSLATE_DIAMOND_ORE) return Items.DIAMOND;
+        if (ore == Items.IRON_ORE || ore == Items.DEEPSLATE_IRON_ORE) return Items.RAW_IRON;
+        if (ore == Items.GOLD_ORE || ore == Items.DEEPSLATE_GOLD_ORE || ore == Items.NETHER_GOLD_ORE) return Items.RAW_GOLD;
+        if (ore == Items.COPPER_ORE || ore == Items.DEEPSLATE_COPPER_ORE) return Items.RAW_COPPER;
+        if (ore == Items.COAL_ORE || ore == Items.DEEPSLATE_COAL_ORE) return Items.COAL;
+        if (ore == Items.EMERALD_ORE || ore == Items.DEEPSLATE_EMERALD_ORE) return Items.EMERALD;
+        if (ore == Items.LAPIS_ORE || ore == Items.DEEPSLATE_LAPIS_ORE) return Items.LAPIS_LAZULI;
+        if (ore == Items.REDSTONE_ORE || ore == Items.DEEPSLATE_REDSTONE_ORE) return Items.REDSTONE;
+        if (ore == Items.NETHER_QUARTZ_ORE) return Items.QUARTZ;
+        if (ore == Items.ANCIENT_DEBRIS) return Items.NETHERITE_SCRAP;
+        return ore;
     }
 }
