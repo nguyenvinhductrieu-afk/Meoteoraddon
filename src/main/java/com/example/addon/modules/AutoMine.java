@@ -5,27 +5,25 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
+import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
-import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
-
-import java.util.List;
+import net.minecraft.util.Hand;
 
 public class AutoMine extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
-    private final SettingGroup sgFilter = settings.createGroup("Filter & Item Settings");
-    private final SettingGroup sgTrash = settings.createGroup("Trash & Sell Settings");
+    private final SettingGroup sgRepair = settings.createGroup("Auto Repair Settings");
 
-    // --- General Settings ---
+    // General Settings
     private final Setting<Item> mineBlock = sgGeneral.add(new ItemSetting.Builder()
         .name("mine-block")
-        .description("Khối quặng cho Baritone #mine.")
+        .description("Khối quặng cho Baritone #mine (ví dụ: DIAMOND_ORE, IRON_ORE...).")
         .defaultValue(Items.DIAMOND_ORE)
         .build()
     );
@@ -39,7 +37,7 @@ public class AutoMine extends Module {
 
     private final Setting<Item> collectItem = sgGeneral.add(new ItemSetting.Builder()
         .name("collect-item")
-        .description("Item cần đếm/bán khi tắt auto-detect.")
+        .description("Item cần lọc/chia kho khi tắt auto-detect.")
         .defaultValue(Items.DIAMOND)
         .visible(() -> !autoDetectDrop.get())
         .build()
@@ -54,51 +52,13 @@ public class AutoMine extends Module {
         .build()
     );
 
-    // --- Filter Settings ---
-    private final Setting<List<Item>> keepItems = sgFilter.add(new ItemListSetting.Builder()
-        .name("keep-items")
-        .description("Danh sách item BẮT BUỘC GIỮ LẠI (không bán/vứt).")
-        .defaultValue(
-            Items.NETHERITE_PICKAXE, Items.DIAMOND_PICKAXE, Items.IRON_PICKAXE,
-            Items.NETHERITE_SWORD, Items.DIAMOND_SWORD,
-            Items.NETHERITE_AXE, Items.DIAMOND_AXE,
-            Items.GOLDEN_APPLE, Items.ENCHANTED_GOLDEN_APPLE,
-            Items.SHULKER_BOX
-        )
-        .build()
-    );
-
-    private final Setting<Boolean> autoDropTrash = sgFilter.add(new BoolSetting.Builder()
-        .name("auto-drop-trash")
-        .description("Tự động vứt bỏ item rác ra đất ngay trong lúc đào.")
-        .defaultValue(false)
-        .build()
-    );
-
-    // --- Trash & Sell Settings ---
-    private final Setting<String> sellCommand = sgTrash.add(new StringSetting.Builder()
-        .name("sell-command")
-        .description("Lệnh bán đồ của server (ví dụ: /sellgui, /sell all, /sell).")
-        .defaultValue("/sellgui")
-        .build()
-    );
-
-    private final Setting<Boolean> sellTargetItem = sgTrash.add(new BoolSetting.Builder()
-        .name("sell-target-item")
-        .description("Bán cả vật phẩm mục tiêu (kim cương/quặng) khi mở GUI bán đồ.")
-        .defaultValue(true)
-        .build()
-    );
-
-    private final Setting<List<Item>> trashItems = sgTrash.add(new ItemListSetting.Builder()
-        .name("trash-items")
-        .description("Danh sách item rác sẽ bị bán hoặc tự động vứt.")
-        .defaultValue(
-            Items.COBBLESTONE, Items.DIRT, Items.SAND, Items.GRAVEL, Items.STONE,
-            Items.NETHERRACK, Items.DIORITE, Items.ANDESITE, Items.GRANITE,
-            Items.COBBLED_DEEPSLATE, Items.DEEPSLATE, Items.ROTTEN_FLESH, Items.BONE,
-            Items.ARROW, Items.GUNPOWDER, Items.STRING, Items.SPIDER_EYE, Items.BLAZE_ROD, Items.ENDER_PEARL
-        )
+    // Repair Settings
+    private final Setting<Integer> minDurability = sgRepair.add(new IntSetting.Builder()
+        .name("min-durability")
+        .description("Độ bền tối thiểu của dụng cụ trước khi dừng đào để dùng bình EXP.")
+        .defaultValue(40)
+        .min(5)
+        .sliderMax(200)
         .build()
     );
 
@@ -106,23 +66,23 @@ public class AutoMine extends Module {
         IDLE,
         START_MINE,
         MINING,
+        AUTO_REPAIR,
         OPEN_SELL_GUI,
-        SELL_GUI
+        SELL_GUI,
+        SPLIT_TARGET_SLOTS
     }
 
     private State currentState = State.IDLE;
     private int timer = 0;
-    private int guiWaitTicks = 0;
 
     public AutoMine() {
-        super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự lọc item, vứt rác và bán item.");
+        super(AddonTemplate.CATEGORY, "AutoMine", "Tự đào quặng, bán rác qua /sellgui, chia 1 ore/ô balo để chống nhặt rác và tự sửa đồ.");
     }
 
     @Override
     public void onActivate() {
         currentState = State.START_MINE;
         timer = 0;
-        guiWaitTicks = 0;
     }
 
     @Override
@@ -144,58 +104,69 @@ public class AutoMine extends Module {
 
         switch (currentState) {
             case START_MINE:
-                if (hasTrashToSell()) {
-                    ChatUtils.sendPlayerMsg("#stop");
-                    currentState = State.OPEN_SELL_GUI;
-                    timer = actionDelay.get();
-                    guiWaitTicks = 0;
-                    break;
-                }
-
                 ChatUtils.sendPlayerMsg("#mine " + mineBlock.get().toString().replace("minecraft:", ""));
                 currentState = State.MINING;
                 break;
 
             case MINING:
-                if (autoDropTrash.get()) {
-                    if (dropTrashFromInventory()) {
-                        timer = 2;
-                        break;
-                    }
+                // 1. Kiểm tra độ bền dụng cụ
+                if (needsRepair()) {
+                    ChatUtils.sendPlayerMsg("#stop");
+                    currentState = State.AUTO_REPAIR;
+                    timer = actionDelay.get();
+                    break;
                 }
 
+                // 2. Khi full balo -> Bán hết item không phải item mục tiêu và chia ore vào ô trống
                 if (isMainInventoryFull()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.OPEN_SELL_GUI;
                     timer = actionDelay.get();
-                    guiWaitTicks = 0;
                     break;
                 }
                 break;
 
+            case AUTO_REPAIR:
+                if (isFullyRepaired()) {
+                    currentState = State.START_MINE;
+                    break;
+                }
+
+                FindItemResult expBottles = InvUtils.findInHotbar(Items.EXPERIENCE_BOTTLE);
+                if (expBottles.found()) {
+                    InvUtils.swap(expBottles.slot(), true);
+                    mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
+                    timer = 2;
+                } else {
+                    currentState = State.START_MINE;
+                }
+                break;
+
             case OPEN_SELL_GUI:
-                ChatUtils.sendPlayerMsg(sellCommand.get());
+                ChatUtils.sendPlayerMsg("/sellgui");
                 currentState = State.SELL_GUI;
                 timer = actionDelay.get();
-                guiWaitTicks = 0;
                 break;
 
             case SELL_GUI:
-                guiWaitTicks++;
-
-                // Chỉ xử lý nếu GUI đang mở KHÔNG PHẢI là túi đồ cá nhân InventoryScreen
-                if (mc.currentScreen instanceof HandledScreen && !(mc.currentScreen instanceof InventoryScreen)) {
+                if (mc.currentScreen instanceof HandledScreen) {
                     HandledScreen<?> screen = (HandledScreen<?>) mc.currentScreen;
-                    boolean sold = doSellItemsFromPlayerInv(screen);
+                    boolean sold = doSellNonTargetItems(screen);
                     if (!sold) {
                         mc.player.closeHandledScreen();
-                        currentState = State.START_MINE;
+                        currentState = State.SPLIT_TARGET_SLOTS;
                         timer = actionDelay.get();
                     } else {
                         timer = actionDelay.get();
                     }
-                } else if (guiWaitTicks > 40) {
-                    // Nếu quá 2 giây không mở được GUI rương -> Quay lại trạng thái đào
+                }
+                break;
+
+            case SPLIT_TARGET_SLOTS:
+                boolean splitPerformed = fillOneEmptySlotWithTarget();
+                if (splitPerformed) {
+                    timer = 1;
+                } else {
                     currentState = State.START_MINE;
                     timer = actionDelay.get();
                 }
@@ -206,32 +177,7 @@ public class AutoMine extends Module {
         }
     }
 
-    private boolean hasTrashToSell() {
-        for (ItemStack stack : mc.player.getInventory().main) {
-            if (stack.isEmpty()) continue;
-            Item item = stack.getItem();
-            if (isTrashItem(item) && !isKeepItem(item)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean dropTrashFromInventory() {
-        for (int i = 0; i < mc.player.getInventory().main.size(); i++) {
-            ItemStack stack = mc.player.getInventory().main.get(i);
-            if (stack.isEmpty()) continue;
-
-            Item item = stack.getItem();
-            if (isTrashItem(item) && !isKeepItem(item)) {
-                InvUtils.drop(i);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean doSellItemsFromPlayerInv(HandledScreen<?> screen) {
+    private boolean doSellNonTargetItems(HandledScreen<?> screen) {
         ScreenHandler handler = screen.getScreenHandler();
         int playerInvStart = handler.slots.size() - 36;
         Item target = getEffectiveCollectItem();
@@ -241,13 +187,13 @@ public class AutoMine extends Module {
             if (stack.isEmpty()) continue;
 
             Item item = stack.getItem();
+            
+            // Bán tất cả ngoại trừ: Item mục tiêu, Khối quặng mục tiêu, Trang bị/Cúp/Kiếm, Bình EXP
+            boolean isTarget = (item == target || item == mineBlock.get());
+            boolean isToolOrArmor = stack.isDamageable();
+            boolean isExp = (item == Items.EXPERIENCE_BOTTLE);
 
-            if (isKeepItem(item)) continue;
-
-            boolean isTrash = isTrashItem(item);
-            boolean isTarget = sellTargetItem.get() && (item == target || item == mineBlock.get());
-
-            if (isTrash || isTarget) {
+            if (!isTarget && !isToolOrArmor && !isExp) {
                 clickSlot(handler.syncId, i, 0, SlotActionType.QUICK_MOVE);
                 return true;
             }
@@ -255,12 +201,50 @@ public class AutoMine extends Module {
         return false;
     }
 
-    private boolean isKeepItem(Item item) {
-        return keepItems.get().contains(item);
-    }
+    private boolean fillOneEmptySlotWithTarget() {
+        Item target = getEffectiveCollectItem();
 
-    private boolean isTrashItem(Item item) {
-        return trashItems.get().contains(item);
+        // Tìm 1 ô trống trong balo chính (slot 9 đến 35)
+        int emptySlot = -1;
+        for (int i = 9; i <= 35; i++) {
+            if (mc.player.playerScreenHandler.getSlot(i).getStack().isEmpty()) {
+                emptySlot = i;
+                break;
+            }
+        }
+
+        if (emptySlot == -1) return false; // Đã phủ kín 1 ore ở tất cả các ô!
+
+        // Tìm 1 ô có chứa item mục tiêu với số lượng > 1 để thực hiện tách
+        int sourceSlot = -1;
+        for (int i = 9; i <= 35; i++) {
+            ItemStack stack = mc.player.playerScreenHandler.getSlot(i).getStack();
+            if ((stack.getItem() == target || stack.getItem() == mineBlock.get()) && stack.getCount() > 1) {
+                sourceSlot = i;
+                break;
+            }
+        }
+
+        if (sourceSlot == -1) {
+            for (int i = 36; i <= 44; i++) {
+                ItemStack stack = mc.player.playerScreenHandler.getSlot(i).getStack();
+                if ((stack.getItem() == target || stack.getItem() == mineBlock.get()) && stack.getCount() > 1) {
+                    sourceSlot = i;
+                    break;
+                }
+            }
+        }
+
+        if (sourceSlot == -1) return false;
+
+        int syncId = mc.player.playerScreenHandler.syncId;
+
+        // Tách 1 item sang ô trống
+        clickSlot(syncId, sourceSlot, 0, SlotActionType.PICKUP);  // Cầm stack
+        clickSlot(syncId, emptySlot, 1, SlotActionType.PICKUP);   // Chuột phải thả 1 item
+        clickSlot(syncId, sourceSlot, 0, SlotActionType.PICKUP);  // Thả phần còn lại về vị trí cũ
+
+        return true;
     }
 
     private void clickSlot(int syncId, int slotId, int button, SlotActionType actionType) {
@@ -269,6 +253,19 @@ public class AutoMine extends Module {
 
     private boolean isMainInventoryFull() {
         return mc.player.getInventory().main.stream().noneMatch(ItemStack::isEmpty);
+    }
+
+    private boolean needsRepair() {
+        ItemStack mainHand = mc.player.getMainHandStack();
+        if (mainHand.isEmpty() || !mainHand.isDamageable()) return false;
+        int currentDurability = mainHand.getMaxDamage() - mainHand.getDamage();
+        return currentDurability <= minDurability.get();
+    }
+
+    private boolean isFullyRepaired() {
+        ItemStack mainHand = mc.player.getMainHandStack();
+        if (mainHand.isEmpty() || !mainHand.isDamageable()) return true;
+        return mainHand.getDamage() == 0;
     }
 
     private Item getEffectiveCollectItem() {
