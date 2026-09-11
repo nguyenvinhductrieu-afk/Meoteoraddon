@@ -20,10 +20,11 @@ import java.util.List;
 
 public class AutoMine extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgFilter = settings.createGroup("Filter & Item Settings");
     private final SettingGroup sgTrash = settings.createGroup("Trash & Sell Settings");
     private final SettingGroup sgRepair = settings.createGroup("Auto Repair Settings");
 
-    // General Settings
+    // --- General Settings ---
     private final Setting<Item> mineBlock = sgGeneral.add(new ItemSetting.Builder()
         .name("mine-block")
         .description("Khối quặng cho Baritone #mine (ví dụ: DIAMOND_ORE, IRON_ORE...).")
@@ -55,17 +56,38 @@ public class AutoMine extends Module {
         .build()
     );
 
-    // Trash & Sell Settings
+    // --- Filter Settings ---
+    private final Setting<List<Item>> keepItems = sgFilter.add(new ItemListSetting.Builder()
+        .name("keep-items")
+        .description("Danh sách item BẮT BUỘC GIỮ LẠI (không bao giờ bán hoặc vứt bỏ).")
+        .defaultValue(
+            Items.NETHERITE_PICKAXE, Items.DIAMOND_PICKAXE, Items.IRON_PICKAXE,
+            Items.NETHERITE_SWORD, Items.DIAMOND_SWORD,
+            Items.NETHERITE_AXE, Items.DIAMOND_AXE,
+            Items.GOLDEN_APPLE, Items.ENCHANTED_GOLDEN_APPLE,
+            Items.EXPERIENCE_BOTTLE, Items.SHULKER_BOX
+        )
+        .build()
+    );
+
+    private final Setting<Boolean> autoDropTrash = sgFilter.add(new BoolSetting.Builder()
+        .name("auto-drop-trash")
+        .description("Tự động vứt bỏ item rác ra đất ngay trong lúc đào (tránh nhanh đầy balo).")
+        .defaultValue(false)
+        .build()
+    );
+
+    // --- Trash & Sell Settings ---
     private final Setting<Boolean> sellTargetItem = sgTrash.add(new BoolSetting.Builder()
         .name("sell-target-item")
-        .description("Bán cả vật phẩm mục tiêu (kim cương/quặng) khi đầy balo.")
+        .description("Bán cả vật phẩm mục tiêu (kim cương/quặng) khi mở GUI bán đồ.")
         .defaultValue(true)
         .build()
     );
 
     private final Setting<List<Item>> trashItems = sgTrash.add(new ItemListSetting.Builder()
         .name("trash-items")
-        .description("Các item rác sẽ được bán vào GUI /sellgui.")
+        .description("Danh sách item rác sẽ bị bán vào /sellgui hoặc tự động vứt.")
         .defaultValue(
             Items.COBBLESTONE, Items.DIRT, Items.SAND, Items.GRAVEL, Items.STONE,
             Items.NETHERRACK, Items.DIORITE, Items.ANDESITE, Items.GRANITE,
@@ -75,7 +97,7 @@ public class AutoMine extends Module {
         .build()
     );
 
-    // Repair Settings
+    // --- Repair Settings ---
     private final Setting<Integer> minDurability = sgRepair.add(new IntSetting.Builder()
         .name("min-durability")
         .description("Độ bền tối thiểu của dụng cụ trước khi dừng đào để dùng bình EXP.")
@@ -98,7 +120,7 @@ public class AutoMine extends Module {
     private int timer = 0;
 
     public AutoMine() {
-        super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự sửa đồ bằng bình EXP và bán item khi đầy balo.");
+        super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự lọc item, vứt rác, tự sửa đồ và bán item.");
     }
 
     @Override
@@ -131,7 +153,15 @@ public class AutoMine extends Module {
                 break;
 
             case MINING:
-                // 1. Kiểm tra độ bền dụng cụ
+                // 1. Lọc và tự động vứt rác ra đất nếu bật autoDropTrash
+                if (autoDropTrash.get()) {
+                    if (dropTrashFromInventory()) {
+                        timer = 2;
+                        break;
+                    }
+                }
+
+                // 2. Kiểm tra độ bền dụng cụ
                 if (needsRepair()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.AUTO_REPAIR;
@@ -139,7 +169,7 @@ public class AutoMine extends Module {
                     break;
                 }
 
-                // 2. Kiểm tra khi full balo -> Đi bán
+                // 3. Kiểm tra khi full balo -> Đi bán đồ
                 if (isMainInventoryFull()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.OPEN_SELL_GUI;
@@ -158,9 +188,8 @@ public class AutoMine extends Module {
                 if (expBottles.found()) {
                     InvUtils.swap(expBottles.slot(), true);
                     mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
-                    timer = 2; // Ném bình EXP nhanh
+                    timer = 2;
                 } else {
-                    // Nếu không còn bình EXP trong hotbar, tiếp tục quay lại đào hoặc dừng
                     currentState = State.START_MINE;
                 }
                 break;
@@ -190,6 +219,22 @@ public class AutoMine extends Module {
         }
     }
 
+    // Lọc và vứt rác khỏi inventory khi đang đào
+    private boolean dropTrashFromInventory() {
+        for (int i = 0; i < mc.player.getInventory().main.size(); i++) {
+            ItemStack stack = mc.player.getInventory().main.get(i);
+            if (stack.isEmpty()) continue;
+
+            Item item = stack.getItem();
+            if (isTrashItem(item) && !isKeepItem(item)) {
+                InvUtils.drop(i);
+                return true; // Vứt từng ô một để tránh bị kick hoặc kẹt
+            }
+        }
+        return false;
+    }
+
+    // Bán item trong GUI /sellgui dựa trên bộ lọc
     private boolean doSellItemsFromPlayerInv(HandledScreen<?> screen) {
         ScreenHandler handler = screen.getScreenHandler();
         int playerInvStart = handler.slots.size() - 36;
@@ -200,7 +245,11 @@ public class AutoMine extends Module {
             if (stack.isEmpty()) continue;
 
             Item item = stack.getItem();
-            boolean isTrash = trashItems.get().contains(item);
+
+            // Nếu nằm trong danh sách GIỮ LẠI -> Bỏ qua ngay
+            if (isKeepItem(item)) continue;
+
+            boolean isTrash = isTrashItem(item);
             boolean isTarget = sellTargetItem.get() && (item == target || item == mineBlock.get());
 
             if (isTrash || isTarget) {
@@ -209,6 +258,15 @@ public class AutoMine extends Module {
             }
         }
         return false;
+    }
+
+    // Logic kiểm tra bộ lọc
+    private boolean isKeepItem(Item item) {
+        return keepItems.get().contains(item);
+    }
+
+    private boolean isTrashItem(Item item) {
+        return trashItems.get().contains(item);
     }
 
     private void clickSlot(int syncId, int slotId, int button, SlotActionType actionType) {
