@@ -8,6 +8,7 @@ import meteordevelopment.meteorclient.utils.player.ChatUtils;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -24,7 +25,7 @@ public class AutoMine extends Module {
     // --- General Settings ---
     private final Setting<Item> mineBlock = sgGeneral.add(new ItemSetting.Builder()
         .name("mine-block")
-        .description("Khối quặng cho Baritone #mine (ví dụ: DIAMOND_ORE, IRON_ORE...).")
+        .description("Khối quặng cho Baritone #mine.")
         .defaultValue(Items.DIAMOND_ORE)
         .build()
     );
@@ -56,7 +57,7 @@ public class AutoMine extends Module {
     // --- Filter Settings ---
     private final Setting<List<Item>> keepItems = sgFilter.add(new ItemListSetting.Builder()
         .name("keep-items")
-        .description("Danh sách item BẮT BUỘC GIỮ LẠI (không bao giờ bán hoặc vứt bỏ).")
+        .description("Danh sách item BẮT BUỘC GIỮ LẠI (không bán/vứt).")
         .defaultValue(
             Items.NETHERITE_PICKAXE, Items.DIAMOND_PICKAXE, Items.IRON_PICKAXE,
             Items.NETHERITE_SWORD, Items.DIAMOND_SWORD,
@@ -69,12 +70,19 @@ public class AutoMine extends Module {
 
     private final Setting<Boolean> autoDropTrash = sgFilter.add(new BoolSetting.Builder()
         .name("auto-drop-trash")
-        .description("Tự động vứt bỏ item rác ra đất ngay trong lúc đào (tránh nhanh đầy balo).")
+        .description("Tự động vứt bỏ item rác ra đất ngay trong lúc đào.")
         .defaultValue(false)
         .build()
     );
 
     // --- Trash & Sell Settings ---
+    private final Setting<String> sellCommand = sgTrash.add(new StringSetting.Builder()
+        .name("sell-command")
+        .description("Lệnh bán đồ của server (ví dụ: /sellgui, /sell all, /sell).")
+        .defaultValue("/sellgui")
+        .build()
+    );
+
     private final Setting<Boolean> sellTargetItem = sgTrash.add(new BoolSetting.Builder()
         .name("sell-target-item")
         .description("Bán cả vật phẩm mục tiêu (kim cương/quặng) khi mở GUI bán đồ.")
@@ -84,7 +92,7 @@ public class AutoMine extends Module {
 
     private final Setting<List<Item>> trashItems = sgTrash.add(new ItemListSetting.Builder()
         .name("trash-items")
-        .description("Danh sách item rác sẽ bị bán vào /sellgui hoặc tự động vứt.")
+        .description("Danh sách item rác sẽ bị bán hoặc tự động vứt.")
         .defaultValue(
             Items.COBBLESTONE, Items.DIRT, Items.SAND, Items.GRAVEL, Items.STONE,
             Items.NETHERRACK, Items.DIORITE, Items.ANDESITE, Items.GRANITE,
@@ -104,6 +112,7 @@ public class AutoMine extends Module {
 
     private State currentState = State.IDLE;
     private int timer = 0;
+    private int guiWaitTicks = 0;
 
     public AutoMine() {
         super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự lọc item, vứt rác và bán item.");
@@ -113,6 +122,7 @@ public class AutoMine extends Module {
     public void onActivate() {
         currentState = State.START_MINE;
         timer = 0;
+        guiWaitTicks = 0;
     }
 
     @Override
@@ -134,11 +144,11 @@ public class AutoMine extends Module {
 
         switch (currentState) {
             case START_MINE:
-                // Tự động kiểm tra nếu trong balo đang chứa rác thì đi bán trước khi gõ lệnh đào
                 if (hasTrashToSell()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.OPEN_SELL_GUI;
                     timer = actionDelay.get();
+                    guiWaitTicks = 0;
                     break;
                 }
 
@@ -147,7 +157,6 @@ public class AutoMine extends Module {
                 break;
 
             case MINING:
-                // 1. Tự động vứt rác ra đất nếu bật autoDropTrash
                 if (autoDropTrash.get()) {
                     if (dropTrashFromInventory()) {
                         timer = 2;
@@ -155,23 +164,27 @@ public class AutoMine extends Module {
                     }
                 }
 
-                // 2. Kiểm tra khi full balo -> Đi bán đồ
                 if (isMainInventoryFull()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.OPEN_SELL_GUI;
                     timer = actionDelay.get();
+                    guiWaitTicks = 0;
                     break;
                 }
                 break;
 
             case OPEN_SELL_GUI:
-                ChatUtils.sendPlayerMsg("/sellgui");
+                ChatUtils.sendPlayerMsg(sellCommand.get());
                 currentState = State.SELL_GUI;
                 timer = actionDelay.get();
+                guiWaitTicks = 0;
                 break;
 
             case SELL_GUI:
-                if (mc.currentScreen instanceof HandledScreen) {
+                guiWaitTicks++;
+
+                // Chỉ xử lý nếu GUI đang mở KHÔNG PHẢI là túi đồ cá nhân InventoryScreen
+                if (mc.currentScreen instanceof HandledScreen && !(mc.currentScreen instanceof InventoryScreen)) {
                     HandledScreen<?> screen = (HandledScreen<?>) mc.currentScreen;
                     boolean sold = doSellItemsFromPlayerInv(screen);
                     if (!sold) {
@@ -181,6 +194,10 @@ public class AutoMine extends Module {
                     } else {
                         timer = actionDelay.get();
                     }
+                } else if (guiWaitTicks > 40) {
+                    // Nếu quá 2 giây không mở được GUI rương -> Quay lại trạng thái đào
+                    currentState = State.START_MINE;
+                    timer = actionDelay.get();
                 }
                 break;
 
@@ -189,7 +206,6 @@ public class AutoMine extends Module {
         }
     }
 
-    // Kiểm tra xem túi đồ có chứa rác cần bán hay không
     private boolean hasTrashToSell() {
         for (ItemStack stack : mc.player.getInventory().main) {
             if (stack.isEmpty()) continue;
@@ -201,7 +217,6 @@ public class AutoMine extends Module {
         return false;
     }
 
-    // Lọc và vứt rác khỏi inventory khi đang đào
     private boolean dropTrashFromInventory() {
         for (int i = 0; i < mc.player.getInventory().main.size(); i++) {
             ItemStack stack = mc.player.getInventory().main.get(i);
@@ -216,7 +231,6 @@ public class AutoMine extends Module {
         return false;
     }
 
-    // Bán item trong GUI /sellgui dựa trên bộ lọc
     private boolean doSellItemsFromPlayerInv(HandledScreen<?> screen) {
         ScreenHandler handler = screen.getScreenHandler();
         int playerInvStart = handler.slots.size() - 36;
@@ -228,7 +242,6 @@ public class AutoMine extends Module {
 
             Item item = stack.getItem();
 
-            // Nếu nằm trong danh sách GIỮ LẠI -> Bỏ qua ngay
             if (isKeepItem(item)) continue;
 
             boolean isTrash = isTrashItem(item);
@@ -242,7 +255,6 @@ public class AutoMine extends Module {
         return false;
     }
 
-    // Logic kiểm tra bộ lọc
     private boolean isKeepItem(Item item) {
         return keepItems.get().contains(item);
     }
