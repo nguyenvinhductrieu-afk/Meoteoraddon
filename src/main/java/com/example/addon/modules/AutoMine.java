@@ -64,6 +64,7 @@ public class AutoMine extends Module {
 
     public enum State {
         IDLE,
+        CHECK_TRASH_BEFORE_MINE,
         START_MINE,
         MINING,
         AUTO_REPAIR,
@@ -76,12 +77,13 @@ public class AutoMine extends Module {
     private int timer = 0;
 
     public AutoMine() {
-        super(AddonTemplate.CATEGORY, "AutoMine", "Tự đào quặng, bán rác qua /sellgui, chia 1 ore/ô balo để chống nhặt rác và tự sửa đồ.");
+        super(AddonTemplate.CATEGORY, "AutoMine", "Bán rác qua /sellgui trước khi đào, tự đào quặng, chia 1 ore/ô balo và tự sửa đồ.");
     }
 
     @Override
     public void onActivate() {
-        currentState = State.START_MINE;
+        // Bắt đầu bằng việc kiểm tra rác trong balo trước
+        currentState = State.CHECK_TRASH_BEFORE_MINE;
         timer = 0;
     }
 
@@ -103,6 +105,15 @@ public class AutoMine extends Module {
         }
 
         switch (currentState) {
+            case CHECK_TRASH_BEFORE_MINE:
+                // Nếu trong người có rác -> Mở /sellgui bán trước, nếu không -> Bắt đầu đào luôn
+                if (hasTrashInMainInv()) {
+                    currentState = State.OPEN_SELL_GUI;
+                } else {
+                    currentState = State.START_MINE;
+                }
+                break;
+
             case START_MINE:
                 ChatUtils.sendPlayerMsg("#mine " + mineBlock.get().toString().replace("minecraft:", ""));
                 currentState = State.MINING;
@@ -117,7 +128,7 @@ public class AutoMine extends Module {
                     break;
                 }
 
-                // 2. Khi full balo -> Bán hết item không phải item mục tiêu và chia ore vào ô trống
+                // 2. Khi full balo -> Bán hết item không phải mục tiêu và chia ore vào ô trống
                 if (isMainInventoryFull()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.OPEN_SELL_GUI;
@@ -177,6 +188,24 @@ public class AutoMine extends Module {
         }
     }
 
+    private boolean hasTrashInMainInv() {
+        Item target = getEffectiveCollectItem();
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (stack.isEmpty()) continue;
+
+            Item item = stack.getItem();
+            boolean isTarget = (item == target || item == mineBlock.get());
+            boolean isToolOrArmor = stack.isDamageable();
+            boolean isExp = (item == Items.EXPERIENCE_BOTTLE);
+
+            if (!isTarget && !isToolOrArmor && !isExp) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean doSellNonTargetItems(HandledScreen<?> screen) {
         ScreenHandler handler = screen.getScreenHandler();
         int playerInvStart = handler.slots.size() - 36;
@@ -213,7 +242,7 @@ public class AutoMine extends Module {
             }
         }
 
-        if (emptySlot == -1) return false; // Đã phủ kín 1 ore ở tất cả các ô!
+        if (emptySlot == -1) return false;
 
         // Tìm 1 ô có chứa item mục tiêu với số lượng > 1 để thực hiện tách
         int sourceSlot = -1;
@@ -240,9 +269,9 @@ public class AutoMine extends Module {
         int syncId = mc.player.playerScreenHandler.syncId;
 
         // Tách 1 item sang ô trống
-        clickSlot(syncId, sourceSlot, 0, SlotActionType.PICKUP);  // Cầm stack
-        clickSlot(syncId, emptySlot, 1, SlotActionType.PICKUP);   // Chuột phải thả 1 item
-        clickSlot(syncId, sourceSlot, 0, SlotActionType.PICKUP);  // Thả phần còn lại về vị trí cũ
+        clickSlot(syncId, sourceSlot, 0, SlotActionType.PICKUP);  
+        clickSlot(syncId, emptySlot, 1, SlotActionType.PICKUP);   
+        clickSlot(syncId, sourceSlot, 0, SlotActionType.PICKUP);  
 
         return true;
     }
