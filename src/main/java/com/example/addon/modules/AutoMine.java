@@ -5,7 +5,6 @@ import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.*;
 import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.utils.player.ChatUtils;
-import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
@@ -14,7 +13,6 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
-import net.minecraft.util.Hand;
 
 import java.util.List;
 
@@ -22,7 +20,6 @@ public class AutoMine extends Module {
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgFilter = settings.createGroup("Filter & Item Settings");
     private final SettingGroup sgTrash = settings.createGroup("Trash & Sell Settings");
-    private final SettingGroup sgRepair = settings.createGroup("Auto Repair Settings");
 
     // --- General Settings ---
     private final Setting<Item> mineBlock = sgGeneral.add(new ItemSetting.Builder()
@@ -65,7 +62,7 @@ public class AutoMine extends Module {
             Items.NETHERITE_SWORD, Items.DIAMOND_SWORD,
             Items.NETHERITE_AXE, Items.DIAMOND_AXE,
             Items.GOLDEN_APPLE, Items.ENCHANTED_GOLDEN_APPLE,
-            Items.EXPERIENCE_BOTTLE, Items.SHULKER_BOX
+            Items.SHULKER_BOX
         )
         .build()
     );
@@ -97,21 +94,10 @@ public class AutoMine extends Module {
         .build()
     );
 
-    // --- Repair Settings ---
-    private final Setting<Integer> minDurability = sgRepair.add(new IntSetting.Builder()
-        .name("min-durability")
-        .description("Độ bền tối thiểu của dụng cụ trước khi dừng đào để dùng bình EXP.")
-        .defaultValue(40)
-        .min(5)
-        .sliderMax(200)
-        .build()
-    );
-
     public enum State {
         IDLE,
         START_MINE,
         MINING,
-        AUTO_REPAIR,
         OPEN_SELL_GUI,
         SELL_GUI
     }
@@ -120,7 +106,7 @@ public class AutoMine extends Module {
     private int timer = 0;
 
     public AutoMine() {
-        super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự lọc item, vứt rác, tự sửa đồ và bán item.");
+        super(AddonTemplate.CATEGORY, "AutoMine", "Đào quặng tự động, tự lọc item, vứt rác và bán item.");
     }
 
     @Override
@@ -148,12 +134,20 @@ public class AutoMine extends Module {
 
         switch (currentState) {
             case START_MINE:
+                // Tự động kiểm tra nếu trong balo đang chứa rác thì đi bán trước khi gõ lệnh đào
+                if (hasTrashToSell()) {
+                    ChatUtils.sendPlayerMsg("#stop");
+                    currentState = State.OPEN_SELL_GUI;
+                    timer = actionDelay.get();
+                    break;
+                }
+
                 ChatUtils.sendPlayerMsg("#mine " + mineBlock.get().toString().replace("minecraft:", ""));
                 currentState = State.MINING;
                 break;
 
             case MINING:
-                // 1. Lọc và tự động vứt rác ra đất nếu bật autoDropTrash
+                // 1. Tự động vứt rác ra đất nếu bật autoDropTrash
                 if (autoDropTrash.get()) {
                     if (dropTrashFromInventory()) {
                         timer = 2;
@@ -161,36 +155,12 @@ public class AutoMine extends Module {
                     }
                 }
 
-                // 2. Kiểm tra độ bền dụng cụ
-                if (needsRepair()) {
-                    ChatUtils.sendPlayerMsg("#stop");
-                    currentState = State.AUTO_REPAIR;
-                    timer = actionDelay.get();
-                    break;
-                }
-
-                // 3. Kiểm tra khi full balo -> Đi bán đồ
+                // 2. Kiểm tra khi full balo -> Đi bán đồ
                 if (isMainInventoryFull()) {
                     ChatUtils.sendPlayerMsg("#stop");
                     currentState = State.OPEN_SELL_GUI;
                     timer = actionDelay.get();
                     break;
-                }
-                break;
-
-            case AUTO_REPAIR:
-                if (isFullyRepaired()) {
-                    currentState = State.START_MINE;
-                    break;
-                }
-
-                FindItemResult expBottles = InvUtils.findInHotbar(Items.EXPERIENCE_BOTTLE);
-                if (expBottles.found()) {
-                    InvUtils.swap(expBottles.slot(), true);
-                    mc.interactionManager.interactItem(mc.player, Hand.MAIN_HAND);
-                    timer = 2;
-                } else {
-                    currentState = State.START_MINE;
                 }
                 break;
 
@@ -219,6 +189,18 @@ public class AutoMine extends Module {
         }
     }
 
+    // Kiểm tra xem túi đồ có chứa rác cần bán hay không
+    private boolean hasTrashToSell() {
+        for (ItemStack stack : mc.player.getInventory().main) {
+            if (stack.isEmpty()) continue;
+            Item item = stack.getItem();
+            if (isTrashItem(item) && !isKeepItem(item)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Lọc và vứt rác khỏi inventory khi đang đào
     private boolean dropTrashFromInventory() {
         for (int i = 0; i < mc.player.getInventory().main.size(); i++) {
@@ -228,7 +210,7 @@ public class AutoMine extends Module {
             Item item = stack.getItem();
             if (isTrashItem(item) && !isKeepItem(item)) {
                 InvUtils.drop(i);
-                return true; // Vứt từng ô một để tránh bị kick hoặc kẹt
+                return true;
             }
         }
         return false;
@@ -275,19 +257,6 @@ public class AutoMine extends Module {
 
     private boolean isMainInventoryFull() {
         return mc.player.getInventory().main.stream().noneMatch(ItemStack::isEmpty);
-    }
-
-    private boolean needsRepair() {
-        ItemStack mainHand = mc.player.getMainHandStack();
-        if (mainHand.isEmpty() || !mainHand.isDamageable()) return false;
-        int currentDurability = mainHand.getMaxDamage() - mainHand.getDamage();
-        return currentDurability <= minDurability.get();
-    }
-
-    private boolean isFullyRepaired() {
-        ItemStack mainHand = mc.player.getMainHandStack();
-        if (mainHand.isEmpty() || !mainHand.isDamageable()) return true;
-        return mainHand.getDamage() == 0;
     }
 
     private Item getEffectiveCollectItem() {
